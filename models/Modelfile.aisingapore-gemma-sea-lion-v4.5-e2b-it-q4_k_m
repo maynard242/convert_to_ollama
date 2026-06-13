@@ -1,0 +1,12 @@
+FROM /Users/levi/data/Projects/convert_to_ollama/models/aisingapore-gemma-sea-lion-v4.5-e2b-it.q4_k_m.gguf
+
+TEMPLATE """{{ if .System }}<start_of_turn>system
+{{ .System }}<end_of_turn>
+{{ end }}{{ if .Prompt }}<start_of_turn>user
+{{ .Prompt }}<end_of_turn>
+{{ end }}<start_of_turn>model
+{{ .Response }}<end_of_turn>
+"""
+
+PARAMETER stop "<end_of_turn>"
+PARAMETER stop "<eos>"

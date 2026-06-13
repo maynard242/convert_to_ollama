@@ -7,9 +7,8 @@ venv/
 
 # Model artifacts
 downloads/
-models/
+models/*.gguf
 llama.cpp/
-*.gguf
 
 # OS/editor
 .DS_Store
