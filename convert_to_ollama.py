@@ -24,6 +24,8 @@ DEFAULT_ALLOW_PATTERNS = [
     "*.safetensors.index.json",
     "config.json",
     "generation_config.json",
+    "preprocessor_config.json",
+    "chat_template.json",
     "tokenizer.json",
     "tokenizer.model",
     "tokenizer_config.json",
@@ -43,7 +45,7 @@ def run(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] | None =
         print(f"$ cd {cwd} && {printable}")
     else:
         print(f"$ {printable}")
-    subprocess.run(cmd, cwd=cwd, env=env, check=True)
+    subprocess.run(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL, check=True)
 
 
 def require_executable(name: str, hint: str) -> None:
@@ -137,17 +139,44 @@ def ensure_llama_cpp(llama_cpp_dir: Path, repo: str, skip_build: bool) -> None:
         )
 
 
-def download_model(model_id: str, revision: str | None, downloads_dir: Path, token: str | None) -> Path:
+def download_model(model_id: str, revision: str | None, downloads_dir: Path, token: str | None) -> tuple[Path, str]:
     local_dir = downloads_dir / slugify_model_id(model_id)
     local_dir.mkdir(parents=True, exist_ok=True)
     print(f"Downloading safetensors snapshot for {model_id} -> {local_dir}")
-    snapshot_download(
-        repo_id=model_id,
-        revision=revision,
-        local_dir=str(local_dir),
-        allow_patterns=DEFAULT_ALLOW_PATTERNS,
-        token=token,
-    )
+    try:
+        snapshot_download(
+            repo_id=model_id,
+            revision=revision,
+            local_dir=str(local_dir),
+            allow_patterns=DEFAULT_ALLOW_PATTERNS,
+            token=token,
+        )
+        resolved_model_id = model_id
+    except Exception as e:
+        if "-it" not in model_id.lower() and not model_id.endswith("-it"):
+            fallback_id = model_id + "-IT"
+            print(f"Failed to download {model_id}. Trying fallback repository: {fallback_id}...")
+            try:
+                fallback_dir = downloads_dir / slugify_model_id(fallback_id)
+                fallback_dir.mkdir(parents=True, exist_ok=True)
+                snapshot_download(
+                    repo_id=fallback_id,
+                    revision=revision,
+                    local_dir=str(fallback_dir),
+                    allow_patterns=DEFAULT_ALLOW_PATTERNS,
+                    token=token,
+                )
+                print(f"Successfully downloaded fallback {fallback_id}")
+                if local_dir.exists() and not any(local_dir.iterdir()):
+                    try:
+                        local_dir.rmdir()
+                    except Exception:
+                        pass
+                return fallback_dir, fallback_id
+            except Exception:
+                pass
+        raise e
+
     safetensors = sorted(local_dir.rglob("*.safetensors"))
     if not safetensors:
         raise RuntimeError(
@@ -155,7 +184,7 @@ def download_model(model_id: str, revision: str | None, downloads_dir: Path, tok
             "This script only converts safetensors checkpoints; choose a safetensors model or revision."
         )
     print(f"Downloaded {len(safetensors)} safetensors file(s).")
-    return local_dir
+    return local_dir, resolved_model_id
 
 
 def convert_to_gguf(
@@ -226,7 +255,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Download a HF safetensors model, convert to GGUF, quantize, and create an Ollama model."
     )
-    parser.add_argument("model_id", help="Hugging Face model repo ID, e.g. Qwen/Qwen2.5-0.5B-Instruct")
+    parser.add_argument("model_ids", nargs="+", help="Hugging Face model repo ID(s), e.g. Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--revision", help="HF branch/tag/commit to download")
     parser.add_argument("--output-dir", type=Path, default=Path("models"), help="Directory for GGUF outputs")
     parser.add_argument("--downloads-dir", type=Path, default=Path("downloads"), help="Directory for HF snapshot downloads")
@@ -253,34 +282,72 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    slug = slugify_model_id(args.model_id)
-    quant_slug = args.quant.lower()
-    output_dir = args.output_dir.resolve()
-    downloads_dir = args.downloads_dir.resolve()
+    model_ids = args.model_ids
+
+    if len(model_ids) > 1:
+        if args.outfile or args.quantized_outfile or args.ollama_name:
+            print(
+                "Warning: Multiple model IDs provided. Overriding specific file paths/names "
+                "(--outfile, --quantized-outfile, --ollama-name) will be ignored to prevent conflicts. "
+                "Default names based on model IDs will be used instead."
+            )
+
     llama_cpp_dir = args.llama_cpp_dir.resolve()
-    intermediate = (args.outfile or output_dir / f"{slug}.{args.outtype}.gguf").resolve()
-    quantized = (args.quantized_outfile or output_dir / f"{slug}.{quant_slug}.gguf").resolve()
-    ollama_name = args.ollama_name or f"{slug}-{quant_slug}"
-    modelfile = output_dir / f"Modelfile.{ollama_name}"
-
     ensure_llama_cpp(llama_cpp_dir, args.llama_cpp_repo, args.skip_llama_build)
-    model_dir = download_model(args.model_id, args.revision, downloads_dir, args.hf_token)
-    convert_to_gguf(model_dir, llama_cpp_dir, intermediate, args.outtype, args.convert_arg)
-    quantize_gguf(llama_cpp_dir, intermediate, quantized, args.quant)
-    write_modelfile(modelfile, quantized, args.num_ctx)
 
-    if args.no_ollama_create:
-        print("Skipped `ollama create` (--no-ollama-create). Run manually:")
-        print(f"  ollama create {ollama_name} -f {modelfile}")
-        print(f"  ollama run {ollama_name}")
-    else:
-        create_ollama_model(ollama_name, modelfile, args.smoke_prompt)
+    failed_models = []
 
-    print("\nDone.")
-    print(f"Safetensors download: {model_dir}")
-    print(f"Intermediate GGUF:    {intermediate}")
-    print(f"Quantized GGUF:       {quantized}")
-    print(f"Ollama model:         {ollama_name}")
+    for model_id in model_ids:
+        print(f"\n{'='*60}\nProcessing model: {model_id}\n{'='*60}")
+        try:
+            slug = slugify_model_id(model_id)
+            quant_slug = args.quant.lower()
+            output_dir = args.output_dir.resolve()
+            downloads_dir = args.downloads_dir.resolve()
+
+            use_overrides = len(model_ids) == 1
+            intermediate = (args.outfile if use_overrides else None) or (output_dir / f"{slug}.{args.outtype}.gguf").resolve()
+            quantized = (args.quantized_outfile if use_overrides else None) or (output_dir / f"{slug}.{quant_slug}.gguf").resolve()
+            ollama_name = (args.ollama_name if use_overrides else None) or f"{slug}-{quant_slug}"
+            modelfile = output_dir / f"Modelfile.{ollama_name}"
+
+            model_dir, resolved_model_id = download_model(model_id, args.revision, downloads_dir, args.hf_token)
+
+            if resolved_model_id != model_id:
+                slug = slugify_model_id(resolved_model_id)
+                intermediate = (args.outfile if use_overrides else None) or (output_dir / f"{slug}.{args.outtype}.gguf").resolve()
+                quantized = (args.quantized_outfile if use_overrides else None) or (output_dir / f"{slug}.{quant_slug}.gguf").resolve()
+                ollama_name = (args.ollama_name if use_overrides else None) or f"{slug}-{quant_slug}"
+                modelfile = output_dir / f"Modelfile.{ollama_name}"
+
+            convert_to_gguf(model_dir, llama_cpp_dir, intermediate, args.outtype, args.convert_arg)
+            quantize_gguf(llama_cpp_dir, intermediate, quantized, args.quant)
+            write_modelfile(modelfile, quantized, args.num_ctx)
+
+            if args.no_ollama_create:
+                print("Skipped `ollama create` (--no-ollama-create). Run manually:")
+                print(f"  ollama create {ollama_name} -f {modelfile}")
+                print(f"  ollama run {ollama_name}")
+            else:
+                create_ollama_model(ollama_name, modelfile, args.smoke_prompt)
+
+            print(f"\nSuccessfully processed: {resolved_model_id}")
+            print(f"Intermediate GGUF:    {intermediate}")
+            print(f"Quantized GGUF:       {quantized}")
+            print(f"Ollama model:         {ollama_name}")
+        except Exception as e:
+            print(f"\nError processing model {model_id}: {e}", file=sys.stderr)
+            failed_models.append((model_id, str(e)))
+
+    if failed_models:
+        print("\n" + "!" * 60)
+        print("Some models failed to process:")
+        for name, err in failed_models:
+            print(f"  - {name}: {err}")
+        print("!" * 60)
+        return 1
+
+    print("\nAll models processed successfully.")
     return 0
 
 
